@@ -272,14 +272,19 @@ def compare_pair(
         if old_meta.page_count != new_meta.page_count:
             timing.page_fingerprint_ms = (time.time() - fingerprint_start) * 1000
             timing.total_ms = (time.time() - start_time) * 1000
-            
-            result["similarity"] = 0.0  # Will be computed more accurately below
+
+            result["similarity"] = 0.0
             result["status"] = STATUS_CHANGED
             notes.append("Early exit: page count mismatch")
             result["notes"] = "; ".join(notes)
-            
-            # Still need to compute actual similarity for reporting
-            # Fall through to full comparison
+
+            if ENABLE_PERFORMANCE_LOGGING:
+                logger.info(
+                    "PDF %s compared in %.1f ms (page count mismatch %d vs %d) - CHANGED",
+                    identifier, timing.total_ms,
+                    old_meta.page_count, new_meta.page_count,
+                )
+            return result
         else:
             # Same page count — compare page fingerprints
             try:

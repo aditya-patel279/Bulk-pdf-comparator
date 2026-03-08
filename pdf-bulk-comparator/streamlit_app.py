@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -146,6 +147,103 @@ st.markdown(
 
     /* ── progress text ── */
     .prog-text { color: #94a3b8; font-size: 0.82rem; margin-top: 0.25rem; }
+
+    /* ── fun loader ── */
+    .fun-loader {
+        text-align: center;
+        padding: 1.4rem 1rem 1.2rem;
+        background: rgba(167,139,250,0.06);
+        border: 1px solid rgba(167,139,250,0.22);
+        border-radius: 16px;
+        margin-bottom: 0.9rem;
+        position: relative;
+        overflow: hidden;
+    }
+    .fun-loader::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(
+            120deg,
+            transparent 0%,
+            rgba(167,139,250,0.07) 40%,
+            rgba(96,165,250,0.07) 60%,
+            transparent 100%
+        );
+        background-size: 200% 100%;
+        animation: shimmer-bg 2.4s linear infinite;
+    }
+    @keyframes shimmer-bg {
+        0%   { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+    }
+
+    .fl-icons span {
+        display: inline-block;
+        font-size: 1.7rem;
+        margin: 0 0.25rem;
+        animation: fl-bounce 0.75s ease-in-out infinite;
+    }
+    @keyframes fl-bounce {
+        0%, 100% { transform: translateY(0px);   }
+        50%       { transform: translateY(-14px); }
+    }
+
+    .fl-msg-wrap {
+        position: relative;
+        height: 1.35rem;
+        margin: 0.65rem 0 0.5rem;
+    }
+    .fl-msg {
+        position: absolute;
+        left: 0; right: 0;
+        opacity: 0;
+        font-size: 0.88rem;
+        font-style: italic;
+        color: #94a3b8;
+        animation: fl-msg-cycle 12.5s ease-in-out infinite;
+    }
+    @keyframes fl-msg-cycle {
+        0%          { opacity: 0; transform: translateY(6px);  }
+        4%, 16%     { opacity: 1; transform: translateY(0px);  }
+        20%, 100%   { opacity: 0; transform: translateY(-6px); }
+    }
+
+    .fl-dots span {
+        display: inline-block;
+        width: 9px; height: 9px;
+        border-radius: 50%;
+        margin: 0 5px;
+        animation: fl-dot-pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes fl-dot-pulse {
+        0%, 80%, 100% { transform: scale(0.55); opacity: 0.35; }
+        40%           { transform: scale(1.1);  opacity: 1;    }
+    }
+
+    /* ── elapsed timer ── */
+    .timer-box {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        border-radius: 999px;
+        padding: 0.35rem 1.1rem;
+        font-size: 1rem;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.03em;
+        margin-bottom: 0.75rem;
+    }
+    .timer-running {
+        color: #60a5fa;
+        border: 1px solid rgba(96,165,250,0.35);
+        background: rgba(96,165,250,0.08);
+    }
+    .timer-done {
+        color: #34d399;
+        border: 1px solid rgba(52,211,153,0.35);
+        background: rgba(52,211,153,0.08);
+    }
 
     @keyframes fadeIn {
         from { opacity: 0; transform: translateY(-12px); }
@@ -336,6 +434,14 @@ def _badge(status: str) -> str:
     return f'<span class="badge {cls}">{label}</span>'
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    mins = int(seconds // 60)
+    secs = seconds % 60
+    if mins > 0:
+        return f"{mins}m {secs:05.2f}s"
+    return f"{secs:.2f}s"
+
+
 # ---------------------------------------------------------------------------
 # Compare button
 # ---------------------------------------------------------------------------
@@ -384,23 +490,66 @@ if run_btn:
     # ── clear cache for fresh comparison ─────────────────────────────────────
     clear_cache()
 
-    # ── compare with parallel processing ────────────────────────────────────
+    # ── timer + progress bar setup ───────────────────────────────────────────
+    start_time = time.time()
+    timer_placeholder = st.empty()
+    timer_placeholder.markdown(
+        '<div class="timer-box timer-running">⏱ 0.00s</div>',
+        unsafe_allow_html=True,
+    )
+
+    _dot_colors = ["#a78bfa", "#60a5fa", "#34d399"]
+    _dot_styles = " ".join(
+        f'<span style="background:{c};animation-delay:{i*0.22}s"></span>'
+        for i, c in enumerate(_dot_colors)
+    )
+    _fun_loader_html = f"""
+    <div class="fun-loader">
+        <div class="fl-icons">
+            <span style="animation-delay:0s">🧑‍💻</span>
+            <span style="animation-delay:0.15s">🕵️</span>
+            <span style="animation-delay:0.3s">🤓</span>
+            <span style="animation-delay:0.45s">💪</span>
+            <span style="animation-delay:0.6s">🙌</span>
+        </div>
+        <div class="fl-msg-wrap">
+            <span class="fl-msg" style="animation-delay:0s">Your PDFs are in good hands 💪</span>
+            <span class="fl-msg" style="animation-delay:2.5s">Good things take a moment ☕</span>
+            <span class="fl-msg" style="animation-delay:5s">Leaving no page unturned 🕵️</span>
+            <span class="fl-msg" style="animation-delay:7.5s">This is the way 🚀</span>
+            <span class="fl-msg" style="animation-delay:10s">Almost done, hang tight! 🎯</span>
+        </div>
+        <div class="fl-dots">{_dot_styles}</div>
+    </div>
+    """
+
+    loader_placeholder = st.empty()
+    loader_placeholder.markdown(_fun_loader_html, unsafe_allow_html=True)
+
     progress_bar = st.progress(0, text=f"Starting parallel comparison ({MAX_WORKERS} workers) …")
     status_text  = st.empty()
     progress_container = st.empty()
-    
-    # Shared state for progress updates
-    completed_count = [0]  # Use list for mutable reference
-    
-    def progress_callback(completed: int, total_count: int):
+
+    completed_count = [0]
+
+    def progress_callback(completed: int, total_count: int) -> None:
         completed_count[0] = completed
         pct = int(completed / total_count * 100)
         progress_bar.progress(pct, text=f"Comparing PDFs: {completed}/{total_count} complete ({pct}%)")
-    
-    # Run parallel comparison
-    with st.spinner(f"Processing {total} PDF pairs in parallel..."):
-        results = compare_pairs_parallel(pairs, progress_callback=progress_callback)
+        elapsed = time.time() - start_time
+        timer_placeholder.markdown(
+            f'<div class="timer-box timer-running">⏱ {_fmt_elapsed(elapsed)}</div>',
+            unsafe_allow_html=True,
+        )
 
+    results = compare_pairs_parallel(pairs, progress_callback=progress_callback)
+
+    loader_placeholder.empty()
+    elapsed_total = time.time() - start_time
+    timer_placeholder.markdown(
+        f'<div class="timer-box timer-done">Scan completed in - ⏱ {_fmt_elapsed(elapsed_total)} &nbsp;·&nbsp;</div>',
+        unsafe_allow_html=True,
+    )
     progress_bar.progress(100, text="✅ Comparison complete!")
     status_text.empty()
     progress_container.empty()
