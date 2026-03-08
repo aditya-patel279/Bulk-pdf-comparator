@@ -14,7 +14,7 @@ import streamlit as st
 # Make sure local packages resolve correctly when running from project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from engine.comparator import compare_pair
+from engine.comparator import compare_pair, compare_pairs_parallel, clear_cache, MAX_WORKERS
 from engine.matcher import build_file_map, build_pairs
 
 # ---------------------------------------------------------------------------
@@ -381,37 +381,29 @@ if run_btn:
 
     total = len(pairs)
 
-    # ── compare with live progress bar ───────────────────────────────────────
-    progress_bar = st.progress(0, text="Starting comparison …")
+    # ── clear cache for fresh comparison ─────────────────────────────────────
+    clear_cache()
+
+    # ── compare with parallel processing ────────────────────────────────────
+    progress_bar = st.progress(0, text=f"Starting parallel comparison ({MAX_WORKERS} workers) …")
     status_text  = st.empty()
-
-    results = []
-    for i, pair in enumerate(pairs, start=1):
-        ident    = pair["identifier"]
-        old_path = pair["old_file"]
-        new_path = pair["new_file"]
-
-        pct = int((i - 1) / total * 100)
-        progress_bar.progress(pct, text=f"Comparing {ident} ({i}/{total}) …")
-
-        try:
-            res = compare_pair(ident, old_path, new_path)
-        except Exception as exc:
-            res = {
-                "identifier": ident,
-                "old_file":   old_path.name if old_path else "-",
-                "new_file":   new_path.name if new_path else "-",
-                "old_pages":  "-",
-                "new_pages":  "-",
-                "similarity": "-",
-                "status":     "UNREADABLE",
-                "notes":      str(exc),
-            }
-
-        results.append(res)
+    progress_container = st.empty()
+    
+    # Shared state for progress updates
+    completed_count = [0]  # Use list for mutable reference
+    
+    def progress_callback(completed: int, total_count: int):
+        completed_count[0] = completed
+        pct = int(completed / total_count * 100)
+        progress_bar.progress(pct, text=f"Comparing PDFs: {completed}/{total_count} complete ({pct}%)")
+    
+    # Run parallel comparison
+    with st.spinner(f"Processing {total} PDF pairs in parallel..."):
+        results = compare_pairs_parallel(pairs, progress_callback=progress_callback)
 
     progress_bar.progress(100, text="✅ Comparison complete!")
     status_text.empty()
+    progress_container.empty()
 
     # ── summary statistics ────────────────────────────────────────────────────
     statuses  = [r["status"] for r in results]

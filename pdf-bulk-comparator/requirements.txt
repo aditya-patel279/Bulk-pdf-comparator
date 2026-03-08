@@ -6,3 +6,8 @@ Pillow>=10.0.0
 pandas>=2.0.0
 openpyxl>=3.1.0
 reportlab>=4.0.0
+rapidfuzz>=3.0.0  # Fast fuzzy string matching (10-50x faster than difflib)
+
+# Optional: Table extraction (install if you have PDFs with complex tables)
+# camelot-py[base]>=0.11.0  # Better for bordered tables (requires ghostscript)
+# tabula-py>=2.9.0  # Alternative table extraction (requires Java)
