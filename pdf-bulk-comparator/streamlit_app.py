@@ -15,6 +15,7 @@ import streamlit as st
 # Make sure local packages resolve correctly when running from project root
 sys.path.insert(0, str(Path(__file__).parent))
 
+from engine.autorenamer import build_matches, do_rename
 from engine.comparator import compare_pair, compare_pairs_parallel, clear_cache, MAX_WORKERS
 from engine.matcher import build_file_map, build_pairs
 
@@ -245,6 +246,22 @@ st.markdown(
         background: rgba(52,211,153,0.08);
     }
 
+    /* ── auto-rename method badges ── */
+    .badge-name      { background: #064e3b; color: #34d399; }
+    .badge-content   { background: #1e3a5f; color: #60a5fa; }
+    .badge-unmatched { background: #450a0a; color: #f87171; }
+
+    /* ── rename success banner ── */
+    .rename-success {
+        background: rgba(52,211,153,0.1);
+        border: 1px solid rgba(52,211,153,0.35);
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        color: #34d399;
+        font-size: 0.92rem;
+        margin: 1rem 0;
+    }
+
     @keyframes fadeIn {
         from { opacity: 0; transform: translateY(-12px); }
         to   { opacity: 1; transform: translateY(0);     }
@@ -442,224 +459,396 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{secs:.2f}s"
 
 
+_METHOD_CONFIG: dict[str, tuple[str, str]] = {
+    "name":          ("badge-name",      "✅ By Name"),
+    "content":       ("badge-content",   "🔍 By Content"),
+    "unmatched_old": ("badge-unmatched", "❌ No Match"),
+    "unmatched_new": ("badge-unmatched", "❌ No Match"),
+}
+
+
+def _method_badge(method: str) -> str:
+    cls, label = _METHOD_CONFIG.get(method, ("badge-warn", method))
+    return f'<span class="badge {cls}">{label}</span>'
+
+
 # ---------------------------------------------------------------------------
-# Compare button
+# Tabs — Auto-Rename | Compare
 # ---------------------------------------------------------------------------
-run_btn = st.button("⚡ Compare PDFs", use_container_width=True, type="primary")
+tab_rename, tab_compare = st.tabs(["🔀  Step 1 · Auto-Rename PDFs", "⚡  Step 2 · Compare PDFs"])
 
-if run_btn:
-    # ── validation ────────────────────────────────────────────────────────────
-    errors = []
-    if not old_folder:
-        errors.append("Please enter the **Old PDFs Folder** path.")
-    elif not Path(old_folder).is_dir():
-        errors.append(f"Old folder not found: `{old_folder}`")
-
-    if not new_folder:
-        errors.append("Please enter the **New PDFs Folder** path.")
-    elif not Path(new_folder).is_dir():
-        errors.append(f"New folder not found: `{new_folder}`")
-
-    if errors:
-        for e in errors:
-            st.error(e)
-        st.stop()
-
-    # ── build file maps ───────────────────────────────────────────────────────
-    with st.spinner("Scanning folders …"):
-        old_map, old_dups = build_file_map(old_folder)
-        new_map, new_dups = build_file_map(new_folder)
-        pairs               = build_pairs(old_map, new_map)
-
-    # ── duplicate warnings ────────────────────────────────────────────────────
-    all_dups = sorted(set(old_dups + new_dups))
-    if all_dups:
-        dup_list = ", ".join(f"<code>{d}</code>" for d in all_dups)
-        st.markdown(
-            f'<div class="dup-warning">⚠️ <strong>Duplicate identifiers detected</strong>'
-            f" — only the first file is used per identifier: {dup_list}</div>",
-            unsafe_allow_html=True,
-        )
-
-    if not pairs:
-        st.warning("No PDF files found in one or both folders.")
-        st.stop()
-
-    total = len(pairs)
-
-    # ── clear cache for fresh comparison ─────────────────────────────────────
-    clear_cache()
-
-    # ── timer + progress bar setup ───────────────────────────────────────────
-    start_time = time.time()
-    timer_placeholder = st.empty()
-    timer_placeholder.markdown(
-        '<div class="timer-box timer-running">⏱ 0.00s</div>',
-        unsafe_allow_html=True,
-    )
-
-    _dot_colors = ["#a78bfa", "#60a5fa", "#34d399"]
-    _dot_styles = " ".join(
-        f'<span style="background:{c};animation-delay:{i*0.22}s"></span>'
-        for i, c in enumerate(_dot_colors)
-    )
-    _fun_loader_html = f"""
-    <div class="fun-loader">
-        <div class="fl-icons">
-            <span style="animation-delay:0s">🧑‍💻</span>
-            <span style="animation-delay:0.15s">🕵️</span>
-            <span style="animation-delay:0.3s">🤓</span>
-            <span style="animation-delay:0.45s">💪</span>
-            <span style="animation-delay:0.6s">🙌</span>
-        </div>
-        <div class="fl-msg-wrap">
-            <span class="fl-msg" style="animation-delay:0s">Your PDFs are in good hands 💪</span>
-            <span class="fl-msg" style="animation-delay:2.5s">Good things take a moment ☕</span>
-            <span class="fl-msg" style="animation-delay:5s">Leaving no page unturned 🕵️</span>
-            <span class="fl-msg" style="animation-delay:7.5s">This is the way 🚀</span>
-            <span class="fl-msg" style="animation-delay:10s">Almost done, hang tight! 🎯</span>
-        </div>
-        <div class="fl-dots">{_dot_styles}</div>
-    </div>
-    """
-
-    loader_placeholder = st.empty()
-    loader_placeholder.markdown(_fun_loader_html, unsafe_allow_html=True)
-
-    progress_bar = st.progress(0, text=f"Starting parallel comparison ({MAX_WORKERS} workers) …")
-    status_text  = st.empty()
-    progress_container = st.empty()
-
-    completed_count = [0]
-
-    def progress_callback(completed: int, total_count: int) -> None:
-        completed_count[0] = completed
-        pct = int(completed / total_count * 100)
-        progress_bar.progress(pct, text=f"Comparing PDFs: {completed}/{total_count} complete ({pct}%)")
-        elapsed = time.time() - start_time
-        timer_placeholder.markdown(
-            f'<div class="timer-box timer-running">⏱ {_fmt_elapsed(elapsed)}</div>',
-            unsafe_allow_html=True,
-        )
-
-    results = compare_pairs_parallel(pairs, progress_callback=progress_callback)
-
-    loader_placeholder.empty()
-    elapsed_total = time.time() - start_time
-    timer_placeholder.markdown(
-        f'<div class="timer-box timer-done">Scan completed in - ⏱ {_fmt_elapsed(elapsed_total)} &nbsp;·&nbsp;</div>',
-        unsafe_allow_html=True,
-    )
-    progress_bar.progress(100, text="✅ Comparison complete!")
-    status_text.empty()
-    progress_container.empty()
-
-    # ── summary statistics ────────────────────────────────────────────────────
-    statuses  = [r["status"] for r in results]
-    n_same    = statuses.count("SAME")
-    n_changed = statuses.count("CHANGED")
-    n_missing = sum(1 for s in statuses if "MISSING" in s)
-    n_unread  = sum(1 for s in statuses if "UNREAD" in s or s == "MISSING_BOTH")
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — Auto-Rename
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_rename:
     st.markdown(
-        f"""
-        <div class="stat-row">
-            <div class="stat-box">
-                <div class="stat-num" style="color:#34d399">{n_same}</div>
-                <div class="stat-lbl">Same</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-num" style="color:#fb923c">{n_changed}</div>
-                <div class="stat-lbl">Changed</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-num" style="color:#818cf8">{n_missing}</div>
-                <div class="stat-lbl">Missing</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-num" style="color:#f87171">{n_unread}</div>
-                <div class="stat-lbl">Unreadable</div>
-            </div>
-            <div class="stat-box">
-                <div class="stat-num" style="color:#e2e8f0">{total}</div>
-                <div class="stat-lbl">Total Pairs</div>
-            </div>
-        </div>
-        """,
+        '<p style="color:#94a3b8;font-size:0.9rem;margin-bottom:1rem;">'
+        "Scan both folders, preview how files are matched by name &amp; content, "
+        "then rename them with <code>001_</code>, <code>002_</code> … prefixes so "
+        "the Compare tab can pair them correctly."
+        "</p>",
         unsafe_allow_html=True,
     )
 
-    # ── results table ─────────────────────────────────────────────────────────
-    st.markdown("### 📋 Comparison Results")
+    scan_btn = st.button("🔍 Scan &amp; Match", use_container_width=True, key="scan_btn")
 
-    # Build HTML table for badge rendering
-    table_rows = ""
-    for r in results:
-        sim_display = (
-            f"{r['similarity']:.4f}" if isinstance(r["similarity"], float) else r["similarity"]
-        )
-        badge_html = _badge(r["status"])
-        table_rows += (
-            f"<tr>"
-            f"<td><code>{r['identifier']}</code></td>"
-            f"<td>{r['old_file']}</td>"
-            f"<td>{r['new_file']}</td>"
-            f"<td style='text-align:center'>{r['old_pages']}</td>"
-            f"<td style='text-align:center'>{r['new_pages']}</td>"
-            f"<td style='text-align:center'>{sim_display}</td>"
-            f"<td style='text-align:center'>{badge_html}</td>"
-            f"<td>{r.get('notes','')}</td>"
-            f"</tr>"
+    if scan_btn:
+        _ar_old = st.session_state.get("old_folder_input", "").strip()
+        _ar_new = st.session_state.get("new_folder_input", "").strip()
+        _ar_errors: list[str] = []
+        if not _ar_old:
+            _ar_errors.append("Please enter the **Old PDFs Folder** path above.")
+        elif not Path(_ar_old).is_dir():
+            _ar_errors.append(f"Old folder not found: `{_ar_old}`")
+        if not _ar_new:
+            _ar_errors.append("Please enter the **New PDFs Folder** path above.")
+        elif not Path(_ar_new).is_dir():
+            _ar_errors.append(f"New folder not found: `{_ar_new}`")
+
+        if _ar_errors:
+            for _e in _ar_errors:
+                st.error(_e)
+        else:
+            _old_files = sorted(Path(_ar_old).glob("*.pdf"))
+            _new_files = sorted(Path(_ar_new).glob("*.pdf"))
+            if not _old_files:
+                st.warning("No PDF files found in the Old folder.")
+            elif not _new_files:
+                st.warning("No PDF files found in the New folder.")
+            else:
+                _ar_progress = st.progress(0, text="Starting scan …")
+
+                def _ar_prog_cb(v: int) -> None:
+                    _ar_progress.progress(
+                        v,
+                        text=f"{'Extracting text from PDFs' if v <= 30 else 'Matching by content'} … {v}%",
+                    )
+
+                with st.spinner("Scanning folders …"):
+                    _ar_pairs = build_matches(_old_files, _new_files, progress_cb=_ar_prog_cb)
+
+                _ar_progress.progress(100, text="✅ Scan complete!")
+                st.session_state["ar_pairs"]   = _ar_pairs
+                st.session_state["ar_renamed"] = False
+
+    # ── Show results if a scan has been run ───────────────────────────────────
+    _ar_pairs: list[dict] = st.session_state.get("ar_pairs", [])
+
+    if _ar_pairs:
+        _n_matched   = sum(1 for p in _ar_pairs if p["id"])
+        _n_content   = sum(1 for p in _ar_pairs if p["method"] == "content")
+        _n_unmatched = max(
+            sum(1 for p in _ar_pairs if p["method"] == "unmatched_old"),
+            sum(1 for p in _ar_pairs if p["method"] == "unmatched_new"),
         )
 
-    table_html = f"""
-    <style>
-    .results-table {{
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 0.84rem;
-        color: #e2e8f0;
-    }}
-    .results-table th {{
-        background: rgba(167,139,250,0.15);
-        color: #a78bfa;
-        font-weight: 600;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        font-size: 0.72rem;
-        padding: 10px 12px;
-        text-align: left;
-        border-bottom: 1px solid rgba(255,255,255,0.1);
-    }}
-    .results-table td {{
-        padding: 9px 12px;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
-        vertical-align: middle;
-        word-break: break-word;
-    }}
-    .results-table tr:hover td {{
-        background: rgba(255,255,255,0.04);
-    }}
-    </style>
-    <table class="results-table">
-      <thead>
-        <tr>
-          <th>Identifier</th>
-          <th>Old File</th>
-          <th>New File</th>
-          <th>Old Pages</th>
-          <th>New Pages</th>
-          <th>Similarity</th>
-          <th>Status</th>
-          <th>Notes</th>
-        </tr>
-      </thead>
-      <tbody>
-        {table_rows}
-      </tbody>
-    </table>
-    """
-    st.markdown(table_html, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="stat-row">
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#34d399">{_n_matched}</div>
+                    <div class="stat-lbl">Matched Pairs</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#60a5fa">{_n_content}</div>
+                    <div class="stat-lbl">By Content</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#f87171">{_n_unmatched}</div>
+                    <div class="stat-lbl">Unmatched Pairs</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        _ar_rows = ""
+        for _p in _ar_pairs:
+            _id_str  = f"{_p['id']:03d}" if _p["id"] else "—"
+            _old_str = _p["old"].name if _p["old"] else "❌ missing"
+            _new_str = _p["new"].name if _p["new"] else "❌ missing"
+            _score   = f"{_p['score']:.0%}" if _p["score"] else "—"
+            _mbadge  = _method_badge(_p["method"])
+            _ar_rows += (
+                f"<tr>"
+                f"<td style='text-align:center'>{_id_str}</td>"
+                f"<td>{_old_str}</td>"
+                f"<td>{_new_str}</td>"
+                f"<td style='text-align:center'>{_mbadge}</td>"
+                f"<td style='text-align:center'>{_score}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"""
+            <style>
+            .results-table {{
+                width: 100%; border-collapse: collapse;
+                font-size: 0.84rem; color: #e2e8f0;
+            }}
+            .results-table th {{
+                background: rgba(167,139,250,0.15); color: #a78bfa;
+                font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+                font-size: 0.72rem; padding: 10px 12px; text-align: left;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+            }}
+            .results-table td {{
+                padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.06);
+                vertical-align: middle; word-break: break-word;
+            }}
+            .results-table tr:hover td {{ background: rgba(255,255,255,0.04); }}
+            </style>
+            <table class="results-table">
+              <thead><tr>
+                <th>ID</th><th>Old File</th><th>New File</th>
+                <th>Match Method</th><th>Score</th>
+              </tr></thead>
+              <tbody>{_ar_rows}</tbody>
+            </table>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if st.session_state.get("ar_renamed"):
+            st.markdown(
+                '<div class="rename-success">✅ Files renamed successfully! '
+                "Switch to the <strong>Compare PDFs</strong> tab to run the comparison.</div>",
+                unsafe_allow_html=True,
+            )
+        elif _n_matched > 0:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button(
+                f"✅ Rename {_n_matched} matched pairs",
+                use_container_width=True,
+                type="primary",
+                key="rename_btn",
+            ):
+                _log = do_rename(_ar_pairs)
+                _ok_files   = sum(1 for l in _log if l[0] == "ok")
+                _skip_files = sum(1 for l in _log if l[0] == "skip")
+                _err_files  = sum(1 for l in _log if l[0] == "error")
+                _ok_pairs   = _ok_files // 2 + _ok_files % 2
+                _skip_pairs = _skip_files // 2 + _skip_files % 2
+                _err_pairs  = _err_files // 2 + _err_files % 2
+
+                if _err_files:
+                    _err_details = "\n".join(
+                        f"• `{l[1]}` → {l[3]}" for l in _log if l[0] == "error"
+                    )
+                    st.error(f"{_ok_pairs} pairs renamed, {_err_pairs} pairs had errors:\n\n{_err_details}")
+                if _ok_pairs > 0:
+                    st.success(f"✅ {_ok_pairs} pair{'s' if _ok_pairs != 1 else ''} renamed successfully!")
+                if _skip_pairs > 0:
+                    st.info(f"{_skip_pairs} pair{'s' if _skip_pairs != 1 else ''} already had the correct prefix — skipped.")
+
+                if _err_files == 0:
+                    st.session_state["ar_renamed"] = True
+                    st.markdown(
+                        '<div class="rename-success">All done! '
+                        "Switch to the <strong>⚡ Step 2 · Compare PDFs</strong> tab.</div>",
+                        unsafe_allow_html=True,
+                    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — Compare
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_compare:
+
+    run_btn = st.button("⚡ Compare PDFs", use_container_width=True, type="primary")
+
+    if run_btn:
+        # ── validation ────────────────────────────────────────────────────────
+        errors: list[str] = []
+        if not old_folder:
+            errors.append("Please enter the **Old PDFs Folder** path.")
+        elif not Path(old_folder).is_dir():
+            errors.append(f"Old folder not found: `{old_folder}`")
+
+        if not new_folder:
+            errors.append("Please enter the **New PDFs Folder** path.")
+        elif not Path(new_folder).is_dir():
+            errors.append(f"New folder not found: `{new_folder}`")
+
+        if errors:
+            for e in errors:
+                st.error(e)
+            st.stop()
+
+        # ── build file maps ───────────────────────────────────────────────────
+        with st.spinner("Scanning folders …"):
+            old_map, old_dups = build_file_map(old_folder)
+            new_map, new_dups = build_file_map(new_folder)
+            pairs              = build_pairs(old_map, new_map)
+
+        # ── duplicate warnings ────────────────────────────────────────────────
+        all_dups = sorted(set(old_dups + new_dups))
+        if all_dups:
+            dup_list = ", ".join(f"<code>{d}</code>" for d in all_dups)
+            st.markdown(
+                f'<div class="dup-warning">⚠️ <strong>Duplicate identifiers detected</strong>'
+                f" — only the first file is used per identifier: {dup_list}</div>",
+                unsafe_allow_html=True,
+            )
+
+        if not pairs:
+            st.warning("No PDF files found in one or both folders.")
+            st.stop()
+
+        total = len(pairs)
+
+        # ── clear cache for fresh comparison ──────────────────────────────────
+        clear_cache()
+
+        # ── timer + loader setup ───────────────────────────────────────────────
+        start_time        = time.time()
+        timer_placeholder = st.empty()
+        timer_placeholder.markdown(
+            '<div class="timer-box timer-running">⏱ 0.00s</div>',
+            unsafe_allow_html=True,
+        )
+
+        _dot_colors = ["#a78bfa", "#60a5fa", "#34d399"]
+        _dot_styles = " ".join(
+            f'<span style="background:{c};animation-delay:{i*0.22}s"></span>'
+            for i, c in enumerate(_dot_colors)
+        )
+        _fun_loader_html = f"""
+        <div class="fun-loader">
+            <div class="fl-icons">
+                <span style="animation-delay:0s">🧑‍💻</span>
+                <span style="animation-delay:0.15s">🕵️</span>
+                <span style="animation-delay:0.3s">🤓</span>
+                <span style="animation-delay:0.45s">💪</span>
+                <span style="animation-delay:0.6s">🙌</span>
+            </div>
+            <div class="fl-msg-wrap">
+                <span class="fl-msg" style="animation-delay:0s">Your PDFs are in good hands 💪</span>
+                <span class="fl-msg" style="animation-delay:2.5s">Good things take a moment ☕</span>
+                <span class="fl-msg" style="animation-delay:5s">Leaving no page unturned 🕵️</span>
+                <span class="fl-msg" style="animation-delay:7.5s">This is the way 🚀</span>
+                <span class="fl-msg" style="animation-delay:10s">Almost done, hang tight! 🎯</span>
+            </div>
+            <div class="fl-dots">{_dot_styles}</div>
+        </div>
+        """
+
+        loader_placeholder = st.empty()
+        loader_placeholder.markdown(_fun_loader_html, unsafe_allow_html=True)
+
+        progress_bar       = st.progress(0, text=f"Starting parallel comparison ({MAX_WORKERS} workers) …")
+        status_text        = st.empty()
+        progress_container = st.empty()
+        completed_count    = [0]
+
+        def progress_callback(completed: int, total_count: int) -> None:
+            completed_count[0] = completed
+            pct = int(completed / total_count * 100)
+            progress_bar.progress(pct, text=f"Comparing PDFs: {completed}/{total_count} complete ({pct}%)")
+            elapsed = time.time() - start_time
+            timer_placeholder.markdown(
+                f'<div class="timer-box timer-running">⏱ {_fmt_elapsed(elapsed)}</div>',
+                unsafe_allow_html=True,
+            )
+
+        results = compare_pairs_parallel(pairs, progress_callback=progress_callback)
+
+        loader_placeholder.empty()
+        elapsed_total = time.time() - start_time
+        timer_placeholder.markdown(
+            f'<div class="timer-box timer-done">⏱ {_fmt_elapsed(elapsed_total)} &nbsp;·&nbsp; ✅ done</div>',
+            unsafe_allow_html=True,
+        )
+        progress_bar.progress(100, text="✅ Comparison complete!")
+        status_text.empty()
+        progress_container.empty()
+
+        # ── summary statistics ────────────────────────────────────────────────
+        statuses  = [r["status"] for r in results]
+        n_same    = statuses.count("SAME")
+        n_changed = statuses.count("CHANGED")
+        n_missing = sum(1 for s in statuses if "MISSING" in s)
+        n_unread  = sum(1 for s in statuses if "UNREAD" in s or s == "MISSING_BOTH")
+
+        st.markdown(
+            f"""
+            <div class="stat-row">
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#34d399">{n_same}</div>
+                    <div class="stat-lbl">Same</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#fb923c">{n_changed}</div>
+                    <div class="stat-lbl">Changed</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#818cf8">{n_missing}</div>
+                    <div class="stat-lbl">Missing</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#f87171">{n_unread}</div>
+                    <div class="stat-lbl">Unreadable</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" style="color:#e2e8f0">{total}</div>
+                    <div class="stat-lbl">Total Pairs</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ── results table ─────────────────────────────────────────────────────
+        st.markdown("### 📋 Comparison Results")
+
+        table_rows = ""
+        for r in results:
+            sim_display = (
+                f"{r['similarity']:.4f}" if isinstance(r["similarity"], float) else r["similarity"]
+            )
+            badge_html = _badge(r["status"])
+            table_rows += (
+                f"<tr>"
+                f"<td><code>{r['identifier']}</code></td>"
+                f"<td>{r['old_file']}</td>"
+                f"<td>{r['new_file']}</td>"
+                f"<td style='text-align:center'>{r['old_pages']}</td>"
+                f"<td style='text-align:center'>{r['new_pages']}</td>"
+                f"<td style='text-align:center'>{sim_display}</td>"
+                f"<td style='text-align:center'>{badge_html}</td>"
+                f"<td>{r.get('notes','')}</td>"
+                f"</tr>"
+            )
+
+        table_html = f"""
+        <style>
+        .results-table {{
+            width: 100%; border-collapse: collapse;
+            font-size: 0.84rem; color: #e2e8f0;
+        }}
+        .results-table th {{
+            background: rgba(167,139,250,0.15); color: #a78bfa;
+            font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+            font-size: 0.72rem; padding: 10px 12px; text-align: left;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }}
+        .results-table td {{
+            padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.06);
+            vertical-align: middle; word-break: break-word;
+        }}
+        .results-table tr:hover td {{ background: rgba(255,255,255,0.04); }}
+        </style>
+        <table class="results-table">
+          <thead>
+            <tr>
+              <th>Identifier</th><th>Old File</th><th>New File</th>
+              <th>Old Pages</th><th>New Pages</th>
+              <th>Similarity</th><th>Status</th><th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>{table_rows}</tbody>
+        </table>
+        """
+        st.markdown(table_html, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Footer
